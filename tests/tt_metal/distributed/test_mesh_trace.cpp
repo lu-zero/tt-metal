@@ -1135,5 +1135,90 @@ TEST_F(MeshTraceDynamicAllocationTestSuite, TraceOverlapDetectionWithAllocations
     ASSERT_TRUE(overlap_detected) << "Overlap detected - trace buffer conflicted with allocations made during trace";
 }
 
+// SCRATCH (vllm.cpp TT backend bisect, 2026-08-16) — NOT upstream.
+// Reproduce the downstream ~38-replay hang as a standalone test:
+// capture an eltwise program that READS a device DRAM buffer, then replay it
+// many times with an enqueue_write_mesh_buffer into that same src buffer
+// between each replay (trace stays live). If write_to_core between replays
+// desyncs expected_num_workers_completed, this hangs ~38-50 replays; without
+// the interleaved write it passes 120.
+namespace scratch {
+
+TEST_F(MeshTraceTestSuite, ScratchInterleavedWriteBetweenReplays) {
+    // Build one eltwise-binary program + its src/dst buffers.
+    std::vector<std::shared_ptr<MeshBuffer>> src0_bufs;
+    std::vector<std::shared_ptr<MeshBuffer>> src1_bufs;
+    std::vector<std::shared_ptr<MeshBuffer>> out_bufs;
+    auto programs = utils::create_eltwise_bin_programs(mesh_device_, src0_bufs, src1_bufs, out_bufs);
+    ASSERT_FALSE(src0_bufs.empty());
+
+    // One workload, reused for warm + capture (programs stay owned by the shared_ptr).
+    MeshCoordinateRange all_devices(mesh_device_->shape());
+    auto wl = std::make_shared<MeshWorkload>();
+    wl->add_program(all_devices, std::move(*programs[0]));
+
+    // Warm the program (compile + populate program cache) before capture.
+    EnqueueMeshWorkload(mesh_device_->mesh_command_queue(), *wl, false);
+    Finish(mesh_device_->mesh_command_queue());
+
+    // Host data to refresh the src buffer with between replays.
+    const size_t buf_bytes = src0_bufs[0]->size();
+    const size_t num_words = buf_bytes / sizeof(uint32_t);
+    std::vector<uint32_t> host_data(num_words, 0);
+    for (size_t i = 0; i < num_words; i++) {
+        host_data[i] = static_cast<uint32_t>(i);
+    }
+
+    // Capture the program into a trace.
+    auto trace_id = BeginTraceCapture(mesh_device_.get(), 0);
+    EnqueueMeshWorkload(mesh_device_->mesh_command_queue(), *wl, false);
+    mesh_device_->end_mesh_trace(0, trace_id);
+
+    uint32_t num_iters = 120;
+    for (uint32_t i = 0; i < num_iters; i++) {
+        if (i % 5 == 0) {
+            log_info(tt::LogTest, "ScratchInterleavedWrite: iter {} of {}", i, num_iters);
+        }
+        // Interleaved host->device write into a buffer the captured program reads.
+        host_data[0] = i;  // mutate so each write is distinct
+        EnqueueWriteMeshBuffer(mesh_device_->mesh_command_queue(), src0_bufs[0], host_data);
+        mesh_device_->replay_mesh_trace(0, trace_id, /*blocking=*/false);
+    }
+    Finish(mesh_device_->mesh_command_queue());
+    mesh_device_->release_mesh_trace(trace_id);
+    SUCCEED();
+}
+
+// Control: same trace, 120 replays, NO interleaved write. Should pass (matches
+// ScratchConsecutiveReplayOneTrace). If this also hangs, the repro is
+// something else.
+TEST_F(MeshTraceTestSuite, ScratchNoInterleavedWriteControl) {
+    std::vector<std::shared_ptr<MeshBuffer>> src0_bufs;
+    std::vector<std::shared_ptr<MeshBuffer>> src1_bufs;
+    std::vector<std::shared_ptr<MeshBuffer>> out_bufs;
+    auto programs = utils::create_eltwise_bin_programs(mesh_device_, src0_bufs, src1_bufs, out_bufs);
+    ASSERT_FALSE(src0_bufs.empty());
+    MeshCoordinateRange all_devices(mesh_device_->shape());
+    auto wl = std::make_shared<MeshWorkload>();
+    wl->add_program(all_devices, std::move(*programs[0]));
+    EnqueueMeshWorkload(mesh_device_->mesh_command_queue(), *wl, false);
+    Finish(mesh_device_->mesh_command_queue());
+    auto trace_id = BeginTraceCapture(mesh_device_.get(), 0);
+    EnqueueMeshWorkload(mesh_device_->mesh_command_queue(), *wl, false);
+    mesh_device_->end_mesh_trace(0, trace_id);
+    uint32_t num_iters = 120;
+    for (uint32_t i = 0; i < num_iters; i++) {
+        if (i % 10 == 0) {
+            log_info(tt::LogTest, "ScratchNoInterleavedWrite: iter {} of {}", i, num_iters);
+        }
+        mesh_device_->replay_mesh_trace(0, trace_id, /*blocking=*/false);
+    }
+    Finish(mesh_device_->mesh_command_queue());
+    mesh_device_->release_mesh_trace(trace_id);
+    SUCCEED();
+}
+
+}  // namespace scratch
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

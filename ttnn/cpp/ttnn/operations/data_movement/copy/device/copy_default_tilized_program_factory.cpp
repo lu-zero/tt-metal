@@ -136,9 +136,21 @@ ttnn::device_operation::ProgramArtifacts CopyDeviceOperation::DefaultTilized::cr
         .hw_config = ttnn::create_reader_datamovement_config(arch),
     };
 
+    // When the output is sharded, define OUT_SHARDED so the writer kernel
+    // uses the sharded path (wait_front, no TensorAccessor DRAM writes).
+    // Without this, the writer uses the interleaved TensorAccessor path
+    // which only writes the first page of a sharded buffer.
+    const bool output_is_sharded = output.is_sharded();
+
+    m2::KernelSpec::CompilerOptions::Defines writer_defines;
+    if (output_is_sharded) {
+        writer_defines.emplace("OUT_SHARDED", "1");
+    }
+
     m2::KernelSpec writer{
         .unique_id = WRITER,
         .source = KERNEL_WRITER_INTERLEAVED,
+        .compiler_options = {.defines = writer_defines},
         .dfb_bindings =
             {
                 m2::DFBBinding{
@@ -252,5 +264,50 @@ ttnn::device_operation::ProgramArtifacts CopyDeviceOperation::DefaultTilized::cr
         .run_params = std::move(run_params),
     };
 }
+
+void CopyDeviceOperation::DefaultTilized::override_runtime_arguments(
+    tt::tt_metal::Program& program,
+    const operation_attributes_t& /*operation_attributes*/,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value,
+    const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
+    auto* input_buffer = tensor_args.input.buffer();
+    auto* output_buffer = tensor_return_value.buffer();
+    const uint32_t input_addr = input_buffer->address();
+    const uint32_t output_addr = output_buffer->address();
+
+    fprintf(stderr, "[COPY-OVERRIDE-TILIZED] input=%u output=%u\n", input_addr, output_addr);
+
+    // Reader kernel (index 0): runtime args [input_buffer_addr, num_tiles, start_tile_id]
+    auto& reader_args = tt::tt_metal::GetRuntimeArgs(program, 0);
+    for (auto& col : reader_args) {
+        for (auto& a : col) {
+            if (a.size() >= 1) {
+                a[0] = input_addr;
+            }
+        }
+    }
+    // Writer kernel (index 1): runtime args [output_buffer_addr, num_tiles, start_tile_id]
+    auto& writer_args = tt::tt_metal::GetRuntimeArgs(program, 1);
+    for (auto& col : writer_args) {
+        for (auto& a : col) {
+            if (a.size() >= 1) {
+                a[0] = output_addr;
+            }
+        }
+    }
+}
+
+// Static assert that the framework detects this override
+static_assert(
+    requires(
+        tt::tt_metal::Program& p,
+        const CopyDeviceOperation::operation_attributes_t& a,
+        const CopyDeviceOperation::tensor_args_t& t,
+        CopyDeviceOperation::tensor_return_value_t& r,
+        const std::optional<ttnn::MeshCoordinate>& c) {
+        CopyDeviceOperation::DefaultTilized::override_runtime_arguments(p, a, t, r, c);
+    },
+    "DefaultTilized::override_runtime_arguments not detected!");
 
 }  // namespace ttnn::prim
