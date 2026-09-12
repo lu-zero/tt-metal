@@ -136,16 +136,12 @@ ttnn::device_operation::ProgramArtifacts CopyDeviceOperation::DefaultTilized::cr
         .hw_config = ttnn::create_reader_datamovement_config(arch),
     };
 
-    // When the output is sharded, define OUT_SHARDED so the writer kernel
-    // uses the sharded path (wait_front, no TensorAccessor DRAM writes).
-    // Without this, the writer uses the interleaved TensorAccessor path
-    // which only writes the first page of a sharded buffer.
-    const bool output_is_sharded = output.is_sharded();
+    // No OUT_SHARDED writer define: upstream TensorAccessor writes sharded
+    // outputs natively, and the kernel's #ifdef OUT_SHARDED stub waits on the
+    // output then exits without writing, so forcing the define silently
+    // no-ops every copy into a sharded output.
 
     m2::KernelSpec::CompilerOptions::Defines writer_defines;
-    if (output_is_sharded) {
-        writer_defines.emplace("OUT_SHARDED", "1");
-    }
 
     m2::KernelSpec writer{
         .unique_id = WRITER,

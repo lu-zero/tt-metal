@@ -208,45 +208,4 @@ CopyDeviceOperation::tensor_return_value_t copy(
         CopyParams{output_mem_config, output_dtype, backwards}, CopyInputs{input, preallocated_output});
 }
 
-void CopyDeviceOperation::override_runtime_arguments(
-    tt::tt_metal::Program& program,
-    const operation_attributes_t& operation_attributes,
-    const tensor_args_t& tensor_args,
-    tensor_return_value_t& tensor_return_value,
-    const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
-    fprintf(
-        stderr,
-        "[COPY-OVERRIDE] called! input_addr=%u output_addr=%u\n",
-        tensor_args.input.buffer()->address(),
-        tensor_return_value.buffer()->address());
-    // Patch reader/writer runtime args with the current input/output buffer
-    // addresses. The program cache reuses the first call's program; without
-    // this override, the second call writes to the first call's output buffer.
-    auto* input_buffer = tensor_args.input.buffer();
-    auto* output_buffer = tensor_return_value.buffer();
-    const uint32_t input_addr = input_buffer->address();
-    const uint32_t output_addr = output_buffer->address();
-
-    // The program has reader (kernel 0) and writer (kernel 1) kernels.
-    // Reader runtime args: [input_buffer_addr, num_tiles, start_tile_id]
-    // Writer runtime args: [output_buffer_addr, num_tiles, start_tile_id]
-    // Patch arg[0] of each core's reader and writer args.
-    auto& reader_args = tt::tt_metal::GetRuntimeArgs(program, 0);
-    for (auto& col : reader_args) {
-        for (auto& a : col) {
-            if (a.size() >= 1) {
-                a[0] = input_addr;
-            }
-        }
-    }
-    auto& writer_args = tt::tt_metal::GetRuntimeArgs(program, 1);
-    for (auto& col : writer_args) {
-        for (auto& a : col) {
-            if (a.size() >= 1) {
-                a[0] = output_addr;
-            }
-        }
-    }
-}
-
 }  // namespace ttnn::prim
